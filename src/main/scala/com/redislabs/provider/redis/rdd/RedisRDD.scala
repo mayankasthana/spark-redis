@@ -7,7 +7,7 @@ import com.redislabs.provider.redis.util.PipelineUtils.mapWithPipeline
 import com.redislabs.provider.redis.{ReadWriteConfig, RedisConfig, RedisNode}
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
-import redis.clients.jedis.{Jedis, ScanParams}
+import redis.clients.jedis.{Jedis, Response, ScanParams}
 import redis.clients.jedis.util.JedisClusterCRC16
 
 import scala.collection.JavaConversions._
@@ -38,13 +38,25 @@ class RedisKVRDD(prev: RDD[String],
   def getKV(nodes: Array[RedisNode], keys: Iterator[String]): Iterator[(String, String)] = {
     groupKeysByNode(nodes, keys).flatMap { case (node, nodeKeys) =>
       val conn = node.endpoint.connect()
-      val stringKeys = filterKeysByType(conn, nodeKeys, "string")
-      val response = mapWithPipeline(conn, stringKeys) { (pipeline, key) =>
-        pipeline.get(key)
-      }
-      val res = stringKeys.zip(response).iterator.asInstanceOf[Iterator[(String, String)]]
+      val res: Seq[(String, String)] =
+        nodeKeys.map(k => JedisClusterCRC16.getSlot(k) -> k)
+          .sortBy(_._1)
+          .grouped(readWriteConfig.maxPipelineSize)
+          .flatMap { batchedKeys: Array[(Int, String)] =>
+            val keysBySlot: Iterable[Array[String]] = batchedKeys.groupBy(_._1).values.map(_.map(_._2))
+            val mappedResp: Seq[util.ArrayList[String]] = mapWithPipeline(conn, keysBySlot) {
+              (pipeline, keys) =>
+                val resp: Response[util.List[String]] = pipeline.mget(keys: _*)
+                resp
+            }.asInstanceOf[Seq[util.ArrayList[String]]]
+            keysBySlot.zip(mappedResp).flatMap { case (keys, values) => keys.zip(values) }
+          }
+          // null is returned when either the key doesn't exist, or the type is not `string`, so filter these out
+          .withFilter(_._2 != null)
+          .toSeq
+
       conn.close()
-      res
+      res.iterator
     }
   }
 
